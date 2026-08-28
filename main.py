@@ -185,11 +185,12 @@ def _entry_date(entry) -> datetime | None:
 
 
 def fetch_feed(feed_cfg: dict, request_timeout: int, proxies: dict | None = None,
-               proxy_on_error: bool = True) -> list[dict]:
+               proxy_on_error: bool = True, proxy_used: set | None = None) -> list[dict]:
     """Fetch one feed, return a list of raw item dicts. Never raises.
 
     Tries direct access first; if that fails and a proxy is configured,
-    retries once through the proxy (proxy_on_error).
+    retries once through the proxy (proxy_on_error). Feed names that end up
+    using the proxy are recorded in `proxy_used` (a thread-safe set).
     """
     name = feed_cfg.get("name", "?")
     url = feed_cfg.get("url", "")
@@ -216,7 +217,9 @@ def fetch_feed(feed_cfg: dict, request_timeout: int, proxies: dict | None = None
             resp = _do_fetch(use_proxy=False)
         except Exception as direct_exc:  # noqa: BLE001
             if proxies and proxy_on_error:
-                log.warning("feed RETRY %-20s via proxy %s after direct fail: %s: %s",
+                if proxy_used is not None:
+                    proxy_used.add(name)
+                log.warning("feed %-22s USED PROXY %s after direct fail (%s: %s)",
                             name, proxies.get("https"), type(direct_exc).__name__,
                             str(direct_exc)[:120])
                 resp = _do_fetch(use_proxy=True)
@@ -252,18 +255,20 @@ def fetch_feed(feed_cfg: dict, request_timeout: int, proxies: dict | None = None
     return items
 
 
-def fetch_all(config: dict) -> list[dict]:
+def fetch_all(config: dict) -> tuple[list[dict], set]:
+    """Fetch all feeds. Returns (items, proxy_used_set)."""
     feeds = config["feeds"]
     timeout = config["news"]["request_timeout"]
     proxies = proxies_for(config)
     proxy_on_error = bool((config.get("network") or {}).get("proxy_on_error", True))
+    proxy_used: set = set()
     all_items: list[dict] = []
     with ThreadPoolExecutor(max_workers=min(10, len(feeds) or 1)) as pool:
-        futures = [pool.submit(fetch_feed, f, timeout, proxies, proxy_on_error)
+        futures = [pool.submit(fetch_feed, f, timeout, proxies, proxy_on_error, proxy_used)
                    for f in feeds]
         for fut in as_completed(futures):
             all_items.extend(fut.result())
-    return all_items
+    return all_items, proxy_used
 
 
 # ---------------------------------------------------------------------------
@@ -647,8 +652,13 @@ def main() -> int:
 
     t0 = time.time()
     log.info("Fetching %d feeds ...", len(config["feeds"]))
-    items = fetch_all(config)
+    items, proxy_used = fetch_all(config)
     log.info("Fetched %d raw items", len(items))
+    if proxy_used:
+        log.warning("PROXY USED by %d feed(s): %s",
+                    len(proxy_used), ", ".join(sorted(proxy_used)))
+    else:
+        log.info("Proxy: no feed needed the proxy (all fetched directly).")
     items = filter_and_dedupe(items, config)
     log.info("After recency/keyword/dedup filter: %d items", len(items))
     if not items:
