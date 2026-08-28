@@ -14,9 +14,10 @@ Collect AI news from 16 sources worldwide every day and generate a bilingual
 3. [快速开始 / Quick start](#3-快速开始--quick-start)
 4. [手动运行 / Run manually](#4-手动运行--run-manually)
 5. [设置每日定时任务 / Schedule a daily task](#5-设置每日定时任务--schedule-a-daily-task)
-6. [配置说明 / Configuration](#6-配置说明--configuration)
-7. [输出说明 / Output](#7-输出说明--output)
-8. [常见问题 / FAQ](#8-常见问题--faq)
+6. [Git 自动提交与推送 / Auto-commit & push to git](#6-git-自动提交与推送--auto-commit--push-to-git)
+7. [配置说明 / Configuration](#7-配置说明--configuration)
+8. [输出说明 / Output](#8-输出说明--output)
+9. [常见问题 / FAQ](#9-常见问题--faq)
 
 ---
 
@@ -33,8 +34,9 @@ python main.py
         ├─ 2. 过滤：24 小时内 + AI 关键词 + 去重
         ├─ 3. LLM 逐条生成双语摘要（英文 45 词内 + 中文 80 字内）[多线程]
         │     + 自动分类（产品/研究/融资/政策/行业）+ 重要度评分 1-5
-        └─ 4. 生成 reports/ai-news-YYYY-MM-DD.md（中英双语 Markdown）
-              + 同目录 .json 原始数据 + logs/ 日志
+        ├─ 4. 生成 reports/ai-news-YYYY-MM-DD.md（中英双语 Markdown）
+        │     + 同目录 .json 原始数据 + logs/ 日志
+        └─ 5. Git：自动 commit 报告并 push 到远程仓库（可选，默认开启）
 ```
 
 The pipeline is fault-tolerant: any single feed or LLM call that fails is
@@ -124,7 +126,42 @@ powershell -ExecutionPolicy Bypass -File register_task.ps1 -Unregister
 
 ---
 
-## 6. 配置说明 / Configuration
+## 6. Git 自动提交与推送 / Auto-commit & push to git
+
+生成报告后，任务会自动把报告文件 commit 并 push 到远程 git 仓库
+（默认开启，可用 `--no-git` 关闭）。
+
+### 一次性初始化（只需做一次）
+
+```powershell
+cd ai-news-daily
+git init                                   # 初始化仓库（本目录已初始化）
+git remote add origin <你的远程仓库地址>     # 例如 https://github.com/you/ai-news-daily.git
+git branch -M main                         # 可选：改主分支名为 main
+git push -u origin main                    # 首次推送，会缓存登录凭据
+```
+
+> 💡 首次 `git push` 会弹出登录窗口（Git Credential Manager），
+> 登录一次后凭据会被缓存，之后定时任务即可静默推送，无需再次登录。
+
+### 配置项（config.json → `git`）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 是否自动 commit + push |
+| `remote` | `origin` | 推送到哪个远程名 |
+| `commit_prefix` | `ai-news: daily report ` | 提交信息前缀 |
+| `auto_add_remote_url` | `""` | 可选：若远程不存在，自动 `git remote add` 这个地址 |
+
+### 失败处理
+
+Git 步骤是**尽力而为**的，任何失败（无仓库、无远程、无凭据、网络问题）
+只会记录 warning 日志，**不会**让任务失败——本地报告仍然生成。
+查看日志：`logs/ai-news-YYYY-MM-DD.log`。
+
+---
+
+## 7. 配置说明 / Configuration
 
 编辑 `config.json`：
 
@@ -163,7 +200,7 @@ powershell -ExecutionPolicy Bypass -File register_task.ps1 -Unregister
 
 ---
 
-## 7. 输出说明 / Output
+## 8. 输出说明 / Output
 
 `reports/ai-news-2026-08-28.md` 结构：
 
@@ -191,7 +228,7 @@ powershell -ExecutionPolicy Bypass -File register_task.ps1 -Unregister
 
 ---
 
-## 8. 常见问题 / FAQ
+## 9. 常见问题 / FAQ
 
 **Q: 没有 API Key 会怎样？**
 A: 自动降级为离线模式：报告用原文标题+简介，中文源给中文、英文源给英文，
@@ -213,6 +250,14 @@ A: 改 `config.json` 的 `llm.base_url` + `llm.model` 即可，任何 OpenAI 兼
 **Q: 报告是英文还是中文为主？**
 A: 双语并列：`英文标题 | 中文标题`，摘要分 `English:` / `中文:` 两行。
    完全对称，方便对照阅读。
+
+**Q: 为什么日志里 Git 提交了但推送失败？**
+A: 常见原因：① 还没 `git remote add origin <地址>`（先做一次性的首次推送）；
+   ② 远程需要登录而定时任务无法弹窗——请先手动 `git push -u origin <分支>`
+   登录一次缓存凭据；③ 网络/远程仓库问题。失败只记日志，不影响报告生成。
+
+**Q: 不想自动推送到 git？**
+A: 运行加 `--no-git`，或把 `config.json` 的 `git.enabled` 改为 `false`。
 
 ---
 
