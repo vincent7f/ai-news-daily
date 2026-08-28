@@ -182,6 +182,16 @@ Git 步骤是**尽力而为**的，任何失败（无仓库、无远程、无凭
 - `max_articles` (20)：每天最多收录条数
 - `min_importance` (2)：低于此重要度的条目不进报告
 
+### 网络设置 `network`（代理）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `proxy` | `""` | 本地代理地址，例如 `http://127.0.0.1:8009` |
+| `proxy_on_error` | `true` | 直连失败时自动改用代理重试（抓取源、LLM、git push 均适用） |
+
+网络不佳或需代理才能访问外网时，在 `config.json` 填上代理地址即可：
+直连优先，失败自动回退到代理，无需改其他配置。
+
 ### 新闻源 `feeds`
 
 每条：`name`（显示名）、`url`（RSS）、`lang`（`en`/`zh`）、
@@ -258,6 +268,12 @@ A: 常见原因：① 还没 `git remote add origin <地址>`（先做一次性�
 
 **Q: 不想自动推送到 git？**
 A: 运行加 `--no-git`，或把 `config.json` 的 `git.enabled` 改为 `false`。
+
+**Q: 直连失败/需要代理才能上网？**
+A: 在 `config.json` 的 `network.proxy` 填上代理地址（如 `http://127.0.0.1:8009`）。
+   任务会自动"直连优先，失败后经代理重试"——新闻源抓取、LLM 调用、git push
+   都会自动回退到代理。日志中会出现 `feed RETRY ... via proxy` 或
+   `retrying via proxy` 字样。
 
 ---
 

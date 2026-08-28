@@ -25,6 +25,11 @@
     "save_json": true
   },
 
+  "network": {
+    "proxy": "http://127.0.0.1:8009",
+    "proxy_on_error": true
+  },
+
   "git": {
     "enabled": true,
     "remote": "origin",

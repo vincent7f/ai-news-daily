@@ -111,6 +111,10 @@ DEFAULT_CONFIG = {
         "min_importance": 2,
         "request_timeout": 30,
     },
+    "network": {
+        "proxy": "",
+        "proxy_on_error": True,
+    },
     "report": {
         "reports_dir": "reports",
         "top_cap": 5,
@@ -126,6 +130,14 @@ DEFAULT_CONFIG = {
 }
 
 
+def proxies_for(config: dict) -> dict | None:
+    """Return requests proxies dict for the configured proxy, or None."""
+    proxy = (config.get("network") or {}).get("proxy", "").strip()
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
+
+
 def load_config(path: str) -> dict:
     cfg_path = Path(path)
     if not cfg_path.exists():
@@ -133,7 +145,7 @@ def load_config(path: str) -> dict:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     # merge defaults so missing keys don't crash the script
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
-    for section in ("llm", "news", "report", "git"):
+    for section in ("llm", "news", "network", "report", "git"):
         if isinstance(cfg.get(section), dict):
             merged[section].update(cfg[section])
     if isinstance(cfg.get("feeds"), list) and cfg["feeds"]:
@@ -172,23 +184,44 @@ def _entry_date(entry) -> datetime | None:
     return None
 
 
-def fetch_feed(feed_cfg: dict, request_timeout: int) -> list[dict]:
-    """Fetch one feed, return a list of raw item dicts. Never raises."""
+def fetch_feed(feed_cfg: dict, request_timeout: int, proxies: dict | None = None,
+               proxy_on_error: bool = True) -> list[dict]:
+    """Fetch one feed, return a list of raw item dicts. Never raises.
+
+    Tries direct access first; if that fails and a proxy is configured,
+    retries once through the proxy (proxy_on_error).
+    """
     name = feed_cfg.get("name", "?")
     url = feed_cfg.get("url", "")
     lang = feed_cfg.get("lang", "en")
     verify = feed_cfg.get("verify_ssl", True)
     log = logging.getLogger("ai-news")
     items: list[dict] = []
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": UA,
-                     "Accept": "application/rss+xml, application/xml, text/xml, */*"},
-            timeout=request_timeout,
-            verify=verify,
-        )
+
+    def _do_fetch(use_proxy: bool):
+        kwargs = {
+            "headers": {"User-Agent": UA,
+                        "Accept": "application/rss+xml, application/xml, text/xml, */*"},
+            "timeout": request_timeout,
+            "verify": verify,
+        }
+        if use_proxy:
+            kwargs["proxies"] = proxies
+        resp = requests.get(url, **kwargs)
         resp.raise_for_status()
+        return resp
+
+    try:
+        try:
+            resp = _do_fetch(use_proxy=False)
+        except Exception as direct_exc:  # noqa: BLE001
+            if proxies and proxy_on_error:
+                log.warning("feed RETRY %-20s via proxy %s after direct fail: %s: %s",
+                            name, proxies.get("https"), type(direct_exc).__name__,
+                            str(direct_exc)[:120])
+                resp = _do_fetch(use_proxy=True)
+            else:
+                raise
         feed = feedparser.parse(resp.content)
         if feed.bozo and not feed.entries:
             raise ValueError(f"bozo parse error: {feed.bozo_exception}")
@@ -222,9 +255,12 @@ def fetch_feed(feed_cfg: dict, request_timeout: int) -> list[dict]:
 def fetch_all(config: dict) -> list[dict]:
     feeds = config["feeds"]
     timeout = config["news"]["request_timeout"]
+    proxies = proxies_for(config)
+    proxy_on_error = bool((config.get("network") or {}).get("proxy_on_error", True))
     all_items: list[dict] = []
     with ThreadPoolExecutor(max_workers=min(10, len(feeds) or 1)) as pool:
-        futures = [pool.submit(fetch_feed, f, timeout) for f in feeds]
+        futures = [pool.submit(fetch_feed, f, timeout, proxies, proxy_on_error)
+                   for f in feeds]
         for fut in as_completed(futures):
             all_items.extend(fut.result())
     return all_items
@@ -312,13 +348,17 @@ def call_llm(item: dict, config: dict) -> dict | None:
         "temperature": llm.get("temperature", 0.3),
         "max_tokens": llm.get("max_tokens", 600),
     }
+    proxies = proxies_for(config)
     for attempt in range(2):
         body = dict(payload)
         if attempt == 0:
             body["response_format"] = {"type": "json_object"}
+        # try direct, then via proxy on the next attempt if configured
+        use_proxy = bool(proxies and attempt >= 1)
         try:
             resp = requests.post(url, headers=headers, json=body,
-                                 timeout=llm.get("timeout_seconds", 120))
+                                 timeout=llm.get("timeout_seconds", 120),
+                                 proxies=proxies if use_proxy else None)
             if resp.status_code != 200:
                 err = resp.text[:300]
                 if attempt == 0 and ("response_format" in err or "json" in err.lower()):
@@ -330,7 +370,9 @@ def call_llm(item: dict, config: dict) -> dict | None:
                 return parsed
         except Exception as exc:  # noqa: BLE001
             logging.getLogger("ai-news").warning(
-                "LLM attempt %d failed for %r: %s", attempt + 1, item["title"][:40], exc)
+                "LLM attempt %d (%s) failed for %r: %s",
+                attempt + 1, "proxy" if use_proxy else "direct",
+                item["title"][:40], exc)
             time.sleep(1.5 * (attempt + 1))
     return None
 
@@ -498,11 +540,19 @@ def git_commit_and_push(report_path: Path, config: dict, date_str: str) -> None:
         return
     log = logging.getLogger("ai-news")
     repo_root = BASE_DIR
+    proxy = proxies_for(config)
 
-    def run_git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    def run_git(*args: str, timeout: int = 120, use_proxy: bool = False) -> subprocess.CompletedProcess:
+        env = None
+        if use_proxy and proxy:
+            env = os.environ.copy()
+            env["HTTP_PROXY"] = proxy["http"]
+            env["HTTPS_PROXY"] = proxy["https"]
+            env["http_proxy"] = proxy["http"]
+            env["https_proxy"] = proxy["https"]
         return subprocess.run(
             ["git", *args], cwd=repo_root, capture_output=True, text=True,
-            timeout=timeout, encoding="utf-8", errors="replace")
+            timeout=timeout, encoding="utf-8", errors="replace", env=env)
 
     try:
         # 1. Is this a git repo?
@@ -548,7 +598,13 @@ def git_commit_and_push(report_path: Path, config: dict, date_str: str) -> None:
                         "push skipped. Set it with: git remote add %s <url>", remote, remote)
             return
         branch = run_git("branch", "--show-current").stdout.strip() or "HEAD"
+        # Try direct push first; if it fails and a proxy is configured, retry via proxy.
         push = run_git("push", remote, branch, timeout=300)
+        if push.returncode != 0 and proxy:
+            log.warning("Git: direct push failed (%s) — retrying via proxy %s",
+                        push.stderr.strip().splitlines()[-1][:120] if push.stderr.strip() else "?",
+                        proxy["https"])
+            push = run_git("push", remote, branch, timeout=300, use_proxy=True)
         if push.returncode != 0:
             log.warning("Git: push to %s/%s failed: %s", remote, branch,
                         push.stderr.strip().replace("\n", " "))
