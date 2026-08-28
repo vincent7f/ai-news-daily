@@ -25,6 +25,13 @@
     "save_json": true
   },
 
+  "git": {
+    "enabled": true,
+    "remote": "origin",
+    "commit_prefix": "ai-news: daily report ",
+    "auto_add_remote_url": ""
+  },
+
   "feeds": [
     { "name": "OpenAI",              "url": "https://openai.com/news/rss.xml",                           "lang": "en" },
     { "name": "Google AI",           "url": "https://blog.google/technology/ai/rss/",                   "lang": "en" },

@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -115,6 +116,12 @@ DEFAULT_CONFIG = {
         "top_cap": 5,
         "save_json": True,
     },
+    "git": {
+        "enabled": False,
+        "remote": "origin",
+        "commit_prefix": "ai-news: daily report ",
+        "auto_add_remote_url": "",
+    },
     "feeds": [],
 }
 
@@ -126,7 +133,7 @@ def load_config(path: str) -> dict:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     # merge defaults so missing keys don't crash the script
     merged = json.loads(json.dumps(DEFAULT_CONFIG))
-    for section in ("llm", "news", "report"):
+    for section in ("llm", "news", "report", "git"):
         if isinstance(cfg.get(section), dict):
             merged[section].update(cfg[section])
     if isinstance(cfg.get("feeds"), list) and cfg["feeds"]:
@@ -482,6 +489,78 @@ def save_report(md: str, items: list[dict], config: dict, date_str: str) -> Path
 
 
 # ---------------------------------------------------------------------------
+# Git commit + push (best-effort: failures are logged, never crash the task)
+# ---------------------------------------------------------------------------
+def git_commit_and_push(report_path: Path, config: dict, date_str: str) -> None:
+    git_cfg = config.get("git") or {}
+    if not git_cfg.get("enabled", False):
+        logging.getLogger("ai-news").info("Git auto-commit disabled (git.enabled=false)")
+        return
+    log = logging.getLogger("ai-news")
+    repo_root = BASE_DIR
+
+    def run_git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=repo_root, capture_output=True, text=True,
+            timeout=timeout, encoding="utf-8", errors="replace")
+
+    try:
+        # 1. Is this a git repo?
+        probe = run_git("rev-parse", "--is-inside-work-tree")
+        if probe.returncode != 0:
+            log.warning("Git: %s is not a git repository — skipping commit/push. "
+                        "Run `git init` in %s to enable.", repo_root, repo_root)
+            return
+
+        # 2. Auto-add remote if configured and missing.
+        remote = git_cfg.get("remote", "origin")
+        has_remote = run_git("remote", "get-url", remote).returncode == 0
+        auto_url = (git_cfg.get("auto_add_remote_url") or "").strip()
+        if not has_remote and auto_url:
+            log.info("Git: adding remote %s -> %s", remote, auto_url)
+            run_git("remote", "add", remote, auto_url)
+
+        # 3. Stage the report file(s).
+        files = [str(report_path)]
+        json_path = report_path.with_suffix(".json")
+        if json_path.exists():
+            files.append(str(json_path))
+        add = run_git("add", "--", *files)
+        if add.returncode != 0:
+            log.warning("Git: `git add` failed: %s", add.stderr.strip())
+            return
+
+        # 4. Commit if there is anything new.
+        staged = run_git("diff", "--cached", "--quiet")
+        if staged.returncode == 0:
+            log.info("Git: nothing new to commit (report unchanged).")
+        else:
+            msg = f"{git_cfg.get('commit_prefix', 'ai-news: daily report ')}{date_str}"
+            commit = run_git("commit", "-m", msg)
+            if commit.returncode != 0:
+                log.warning("Git: commit failed: %s", commit.stderr.strip())
+                return
+            log.info("Git: committed %s", msg)
+
+        # 5. Push (only if a remote exists).
+        if run_git("remote", "get-url", remote).returncode != 0:
+            log.warning("Git: remote '%s' not configured — committed locally, "
+                        "push skipped. Set it with: git remote add %s <url>", remote, remote)
+            return
+        branch = run_git("branch", "--show-current").stdout.strip() or "HEAD"
+        push = run_git("push", remote, branch, timeout=300)
+        if push.returncode != 0:
+            log.warning("Git: push to %s/%s failed: %s", remote, branch,
+                        push.stderr.strip().replace("\n", " "))
+            return
+        log.info("Git: pushed report to %s/%s", remote, branch)
+    except subprocess.TimeoutExpired:
+        log.warning("Git: operation timed out — skipped.")
+    except Exception as exc:  # noqa: BLE001 - never let git break the daily task
+        log.warning("Git: unexpected error during commit/push: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -494,6 +573,8 @@ def main() -> int:
     parser.add_argument("--hours", type=int, default=None, help="override hours_back")
     parser.add_argument("--max", dest="max_articles", type=int, default=None,
                         help="override max_articles")
+    parser.add_argument("--no-git", action="store_true",
+                        help="skip git commit/push even if enabled in config")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -553,6 +634,10 @@ def main() -> int:
     md = build_report(items, meta)
     out = save_report(md, items, config, date_str)
     log.info("Report written: %s", out)
+    if args.no_git:
+        log.info("Git step skipped (--no-git).")
+    else:
+        git_commit_and_push(out, config, date_str)
     log.info("Run finished in %.1fs — %d articles from %d sources",
              time.time() - t0, len(items), len({it['source'] for it in items}))
     return 0

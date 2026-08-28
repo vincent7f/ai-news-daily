@@ -1,9 +1,11 @@
-# Outputs
-# reports/
+# Generated reports ARE committed (the daily task commits and pushes them to git).
+# Only logs and local environment artifacts are ignored.
+
+# Logs (not committed)
 logs/
 __pycache__/
 *.pyc
 
-# Environment & local cache
+# Local environment & cache (not committed)
 .venv/
 wheels/
